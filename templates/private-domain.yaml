@@ -1,0 +1,545 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation template for implementing network-safe analytics tools within AWS Services
+Metadata:
+  Authors:
+    Description: |
+      Scott Schmidt (scott@1strategy.com)
+
+  Purpose:
+    Description: This template is used to create a stack that implements an Amazon Elasticsearch Domain in private subnet space and Cognito-based authentication for Kibana Dashboard via Nginx reverse proxy.
+
+  License:
+    Description: |
+      Copyright 2019 1Strategy
+
+      Licensed under the Apache License, Version 2.0 (the "License");
+      you may not use this file except in compliance with the License.
+      You may obtain a copy of the License at
+
+          http://www.apache.org/licenses/LICENSE-2.0
+
+      Unless required by applicable law or agreed to in writing, software
+      distributed under the License is distributed on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+      See the License for the specific language governing permissions and
+      limitations under the License.
+
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Authentication Parameters
+        Parameters:
+          - CognitoAdminUserEmail
+          - CognitoDomainName
+      - Label:
+          default: Network Parameters
+        Parameters:
+          - VpcId
+          - PrivateSubnetIds
+          - ProxyServerPublicSubnet
+      - Label:
+          default: Elasticsearch Parameters
+        Parameters:
+          - DomainName
+          - DedicatedMasterEnabled
+          - ElasticsearchVersion
+          - EncryptionEnabled
+          - KmsKeyId
+          - ZoneAwarenessEnabled
+      - Label:
+          default: Reverse Proxy Parameters
+        Parameters:
+          - KeyName
+          - ProxyServerInstanceType
+
+    ParameterLabels:
+      CognitoAdminUserEmail:
+        default: Kibana AdminUser email address
+      CognitoDomainName:
+        default: Unique domain name for user pool domain
+      VpcId:
+        default: VPC ID
+      PrivateSubnetIds:
+        default: List of private subnet IDs
+      ProxyServerPublicSubnet:
+        default: Public subnet ID
+      DomainName:
+        default: Elasticsearch domain name
+      DedicatedMasterEnabled:
+        default: Enable dedicated Elasticsearch master
+      ElasticsearchVersion:
+        default: Elasticsearch Version
+      EncryptionEnabled:
+        default: Elasticsearch Encryption
+      KmsKeyId:
+        default: KMS Key ID
+      ZoneAwarenessEnabled:
+        default: Availability Zone awareness
+      KeyName:
+        default: SSH Key name
+      ProxyServerInstanceType:
+        default: EC2 Instnace type
+
+Parameters:
+  CognitoAdminUserEmail:
+    Type: String
+    Description: Email Address for Kibana Dashboard Admin User
+
+  CognitoDomainName:
+    Type: String
+    Description: What unique domain name should be used for the Cognito User Pool Domain?
+    AllowedPattern: "^[a-z]+([a-z0-9\-]+)"
+
+  DomainName:
+    Type: String
+    Description: Name of the Elasticsearch Domain
+
+  DedicatedMasterEnabled:
+    Type: String
+    Description: Enable dedicated master node for Elasticsearch Domain?
+    AllowedValues:
+      - true
+      - false
+
+  ElasticsearchVersion:
+    Type: String
+    Description: What version of Elasticsearch would you like? (currently only allows 7.1)
+    AllowedValues:
+      - 7.1
+
+  EncryptionEnabled:
+    Type: String
+    Description: Enable encryption at rest on the Elasticsearch Cluster?
+    AllowedValues:
+      - true
+      - false
+
+  KmsKeyId:
+    Type: String
+    Description: What KMS Encryption Key ID should be used for the Elasticsearch Cluster? (Required if EncryptionEnabled is true)
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: What is the ID of the VPC to locate the Elasticsearch Domain into?
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Comma-separated list of Private Subnet IDs for Elasticsearch Domain? (Must be subnets within the VpcId parameter provided)
+
+  ZoneAwarenessEnabled:
+    Type: String
+    Description: Should the ES Domain distribute cluster nodes to multiple AZs?
+    AllowedValues:
+      - true
+      - false
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: (Optional) What keypair should be provided to the reverse proxy server?
+
+  ProxyServerInstanceType:
+    Type: String
+    Description: What instance type/size would you like for the reverse proxy server?
+    # TODO: Add any specific instance types here that you require for your deployment
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+
+  ProxyServerPublicSubnet:
+    Type: AWS::EC2::Subnet::Id
+    Description: What Public subnet would you like to use for the reverse proxy server? (Must be subnets within the VpcId parameter provided)
+
+Conditions:
+  HasMaster:
+    !Equals [!Ref DedicatedMasterEnabled, true]
+  EncryptionEnabled:
+    !Equals [!Ref EncryptionEnabled, true]
+  HasKmsKey:
+    !Equals [!Ref KmsKeyId, true]
+  HasZoneAwarenessEnabled:
+    !Equals [!Ref ZoneAwarenessEnabled, true]
+  HasKeyName:
+    !Not [!Equals [!Ref KeyName, ""]]
+
+Mappings:
+  # NOTE: Use these mappings to easily configure the Elasticsearch Domain
+  ElasticsearchConfig:
+    General:
+      ZoneAwarenessEnabled: true
+      AzCount: 2
+    MasterNode:
+      InstanceType: "m5.large.elasticsearch"
+      InstanceCount: 2
+    ClusterNodes:
+      InstanceType: "m5.large.elasticsearch"
+      InstanceCount: 2
+    Ebs:
+      SnapshotStartHour: 0
+      EbsVolumeSize: 10
+      EbsVolumeType: gp2
+      EbsVolumeIops: 0
+  LinuxAmis:
+    us-west-1:
+      AmiId: ami-03caa3f860895f82e
+    us-west-2:
+      AmiId: ami-04590e7389a6e577c
+    us-east-1:
+      AmiId: ami-062f7200baf2fa504
+    us-east-2:
+      AmiId: ami-02ccb28830b645a41
+
+Resources:
+  # Cognito configurations for authenticated Kibana Dashboard access
+  KibanaUserPool:
+    Type: AWS::Cognito::UserPool
+
+  KibanaUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomainName
+      UserPoolId: !Ref KibanaUserPool
+
+  KibanaIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      AllowUnauthenticatedIdentities: true
+
+  KibanaUserPoolGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref KibanaUserPool
+      Precedence: 0
+
+  KibanaUserPoolUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref KibanaUserPool
+      Username: AdminUser
+      DesiredDeliveryMediums:
+        - EMAIL
+      UserAttributes:
+        - Name: email
+          Value: !Ref CognitoAdminUserEmail
+
+  KibanaIdentityPoolRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Condition:
+              StringEquals:
+                cognito-identity.amazonaws.com:aud: !Ref KibanaIdentityPool
+              ForAnyValue:StringLike:
+                cognito-identity.amazonaws.com:amr: authenticated
+      Policies:
+        - PolicyName: AllowFederatedAccessToKibana
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttp*
+                  - iam:PassRole
+                  - iam:GetRole
+                Resource:
+                  - "*"
+
+  RoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref KibanaIdentityPool
+      Roles:
+        authenticated: !GetAtt KibanaIdentityPoolRole.Arn
+
+  # Elasticsearch Domain Resources - Domain located in private subnet(s) / Reverse Proxy locate in public subnet
+  KibanaDashboardAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: es.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonESCognitoAccess
+      Policies:
+        - PolicyName: kibana-dashboard-cognito-read-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:List*
+                  - cognito-idp:Describe*
+                  - cognito-identity:List*
+                  - cognito-identity:Describe*
+                Resource: '*'
+        - PolicyName: kibana-dashboard-iam-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:CreateRole
+                  - iam:AttachRolePolicy
+                Resource: '*'
+        - PolicyName: kibana-dashboard-vpc-read-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                Resource: '*'
+
+  ElasticsearchDomain:
+    Type: AWS::Elasticsearch::Domain
+    Properties:
+      AccessPolicies:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt KibanaDashboardAccessRole.Arn
+            Action:
+              - es:*
+            Resource:
+              - !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}/*"
+      AdvancedOptions:
+        rest.action.multi.allow_explicit_index: "true"
+      DomainName: !Ref DomainName
+      ElasticsearchVersion: !Ref ElasticsearchVersion
+      ElasticsearchClusterConfig:
+        DedicatedMasterEnabled: !Ref DedicatedMasterEnabled
+        DedicatedMasterCount: !If [HasMaster, !FindInMap [ElasticsearchConfig, MasterNode, InstanceCount], !Ref "AWS::NoValue"]
+        DedicatedMasterType: !If [HasMaster, !FindInMap [ElasticsearchConfig, MasterNode, InstanceType], !Ref "AWS::NoValue"]
+        InstanceCount: !FindInMap [ElasticsearchConfig, ClusterNodes, InstanceCount]
+        InstanceType: !FindInMap [ElasticsearchConfig, ClusterNodes, InstanceType]
+        ZoneAwarenessEnabled: !Ref ZoneAwarenessEnabled
+        ZoneAwarenessConfig:
+          AvailabilityZoneCount: !If [HasZoneAwarenessEnabled, !FindInMap [ElasticsearchConfig, General, AzCount], !Ref "AWS::NoValue"]
+      EBSOptions:
+        EBSEnabled: true
+        Iops: !FindInMap [ElasticsearchConfig, Ebs, EbsVolumeIops]
+        VolumeType: !FindInMap [ElasticsearchConfig, Ebs, EbsVolumeType]
+        VolumeSize: !FindInMap [ElasticsearchConfig, Ebs, EbsVolumeSize]
+      EncryptionAtRestOptions:
+        Enabled: !If [EncryptionEnabled, true, !Ref "AWS::NoValue"]
+        KmsKeyId: !If [HasKmsKey, !Ref KmsKeyId, !Ref "AWS::NoValue"]
+      NodeToNodeEncryptionOptions:
+        Enabled: !If [EncryptionEnabled, true, !Ref "AWS::NoValue"]
+      SnapshotOptions:
+        AutomatedSnapshotStartHour: !FindInMap [ElasticsearchConfig, Ebs, SnapshotStartHour]
+      CognitoOptions:
+        Enabled: true
+        IdentityPoolId: !Ref KibanaIdentityPool
+        UserPoolId: !Ref KibanaUserPool
+        RoleArn: !GetAtt KibanaDashboardAccessRole.Arn
+      VPCOptions:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds:
+          - !Ref DomainSecurityGroup
+      Tags:
+        - Key: Name
+          Value: Demo-Domain
+
+  DomainSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: Elasticsearch Domain
+      GroupDescription: Allow HTTPS traffic to Elasticsearch Domain
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref KibanaProxySecurityGroup
+
+# KIBANA PROXY SERVER
+  KibanaProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Proxy Server
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp  # TODO: TEST ONLY / REMOVE IN PROD OR SCOPE CIDR RANGE
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  KibanaProxyInstance:
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+           - 01_setupCfnHup
+           - 02_configTls  # TODO: TEST ONLY / REMOVE IN PROD OR CONFIG FOR YOUR OWN CERT
+           - 03_configNginx
+           - 04_enableNginx
+        # Cfn-hup setting, it is to monitor the change of metadata.
+        # When there is change in the contents of json file in the metadata section, cfn-hup will call cfn-init to restart.
+        01_setupCfnHup:
+          files:
+            "/etc/cfn/cfn-hup.conf":
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=1
+              mode: "000400"
+              owner: root
+              group: root
+            "/lib/systemd/system/cfn-hup.service":
+              content: |
+                [Unit]
+                Description=cfn-hup daemon
+                [Service]
+                Type=simple
+                ExecStart=/opt/aws/bin/cfn-hup
+                Restart=always
+                [Install]
+                WantedBy=multi-user.target
+          commands:
+            01enable_cfn_hup:
+              command: systemctl enable cfn-hup.service
+            02start_cfn_hup:
+              command: systemctl start cfn-hup.service
+        02_configTls:  # NOTE: Creates a config file for self-signing TLS/SSL Cert; TEST ONLY / REMOVE IN PROD
+          files:
+            "/etc/nginx/req.conf":
+              mode: "000400"
+              owner: root
+              group: root
+              content: |
+                [req]
+                distinguished_name = req_distinguished_name
+                x509_extensions = v3_req
+                prompt = no
+                [req_distinguished_name]
+                C = US
+                ST = WA
+                L = Seattle
+                O = Example
+                OU = IT
+                CN = www.example.com
+                [v3_req]
+                keyUsage = critical, digitalSignature, keyAgreement
+                extendedKeyUsage = serverAuth
+                subjectAltName = @alt_names
+                [alt_names]
+                DNS.1 = www.example.com
+                DNS.2 = example.com
+                DNS.3 = example.net
+          commands:
+            01generate_self_signed_cert:
+              command: openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/nginx/cert.key -out /etc/nginx/cert.crt -config /etc/nginx/req.conf
+        03_configNginx:
+          files:
+            "/etc/nginx/conf.d/default.conf":
+              mode: "000400"
+              owner: root
+              group: root
+              content: !Sub |
+                server {
+                   listen 443;
+                   server_name $host;
+                   rewrite ^/$ https://$host/_plugin/kibana redirect;
+
+                   ssl_certificate           /etc/nginx/cert.crt;
+                   ssl_certificate_key       /etc/nginx/cert.key;
+
+                   ssl on;
+                   ssl_session_cache  builtin:1000  shared:SSL:10m;
+                   ssl_protocols  TLSv1 TLSv1.1 TLSv1.2;
+                   ssl_ciphers HIGH:!aNULL:!eNULL:!EXPORT:!CAMELLIA:!DES:!MD5:!PSK:!RC4;
+                   ssl_prefer_server_ciphers on;
+
+
+                   location ^~ /_plugin/kibana {
+                       # Forward requests to Kibana
+                       proxy_pass https://${ElasticsearchDomain.DomainEndpoint}/_plugin/kibana;
+
+                       # Handle redirects to Amazon Cognito
+                       proxy_redirect https://${KibanaUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com https://$host;
+
+                       # Update cookie domain and path
+                       proxy_cookie_domain ${ElasticsearchDomain.DomainEndpoint} $host;
+
+                       proxy_set_header Accept-Encoding "";
+                       sub_filter_types *;
+                       sub_filter ${ElasticsearchDomain.DomainEndpoint} $host;
+                       sub_filter_once off;
+
+                       # Response buffer settings
+                       proxy_buffer_size 128k;
+                       proxy_buffers 4 256k;
+                       proxy_busy_buffers_size 256k;
+                   }
+
+                   location ~ \/(log|sign|error|fav|forgot|change) {
+                       # Forward requests to Cognito
+                       proxy_pass https://${KibanaUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com;
+
+                       # Handle redirects to Kibana
+                       proxy_redirect https://${ElasticsearchDomain.DomainEndpoint} https://$host;
+
+                       # Handle redirects to Amazon Cognito
+                       proxy_redirect https://${KibanaUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com https://$host;
+
+                       # Update cookie domain
+                       proxy_cookie_domain ${KibanaUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com $host;
+                   }
+                }
+        04_enableNginx:
+          services:
+            sysvinit:
+              nginx:
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                  - "/etc/nginx/conf.d/default.conf"
+    Type: AWS::EC2::Instance
+    Properties:
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      ImageId: !FindInMap [LinuxAmis, !Ref "AWS::Region", AmiId]
+      InstanceType: !Ref ProxyServerInstanceType
+      SubnetId: !Ref ProxyServerPublicSubnet
+      SecurityGroupIds:
+        - !Ref KibanaProxySecurityGroup
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash -ex
+              yum update -y
+              IPAddress=${elasticip}
+              amazon-linux-extras install nginx1.12 -y
+              /opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource KibanaProxyInstance --region ${AWS::Region} --configsets default
+              /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource KibanaProxyInstance --region ${AWS::Region}
+            - { elasticip: !Ref ElasticIpAddress }
+      Tags:
+        - Key: Name
+          Value: Kibana Reverse Proxy
+
+  ElasticIpAddress:
+    Type: AWS::EC2::EIP
+
+  IPAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref KibanaProxyInstance
+      EIP: !Ref ElasticIpAddress
