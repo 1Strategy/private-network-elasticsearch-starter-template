@@ -413,11 +413,29 @@ Resources:
                 Restart=always
                 [Install]
                 WantedBy=multi-user.target
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.KibanaProxyInstance.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init --verbose --stack=${AWS::StackName} --region=${AWS::Region} --resource=KibanaProxyInstance --configsets default
+                runas=root
+              mode: '000400'
+              owner: root
+              group: root
           commands:
             01enable_cfn_hup:
               command: systemctl enable cfn-hup.service
             02start_cfn_hup:
               command: systemctl start cfn-hup.service
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - "/etc/cfn/cfn-hup.conf"
+                  - "/etc/cfn/hooks.d/cfn-auto-reloader.conf"
         02_configTls:  # NOTE: Creates a config file for self-signing TLS/SSL Cert; TEST ONLY / REMOVE IN PROD
           files:
             "/etc/nginx/req.conf":
