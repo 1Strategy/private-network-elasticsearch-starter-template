@@ -74,7 +74,7 @@ Parameter files are located in the project directory under the [Parameters/](./p
 ### Deploying the template with the AWS CloudFormation CLI
 
 ```
-aws cloudformation deploy \                                                                                                                ⏎
+aws cloudformation deploy \
     --stack-name demo-domain \
     --template-file templates/private-domain.yaml \
     --parameter-overrides file://parameters/us-west-2/parameters.json \

@@ -88,7 +88,7 @@ Parameters:
   CognitoDomainName:
     Type: String
     Description: What unique domain name should be used for the Cognito User Pool Domain?
-    AllowedPattern: "^[a-z]+([a-z0-9\-]+)"
+    AllowedPattern: ^[a-z]+([a-z0-9\-]+)
 
   DomainName:
     Type: String
